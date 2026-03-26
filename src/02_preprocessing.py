@@ -101,9 +101,9 @@ df['log_net_charge'] = np.log1p(df['Net Charge Billed Currency'])
 
 ##### FEATURE ENGINEERING ###########################################
 
-height = df['Package Dimensions Height (inches)']
-width = df['Package Dimensions Width (inches)']
-length = df['Package Dimensions Length (inches)']
+height = df['Dimmed Height (in)']
+width = df['Dimmed Width (in)']
+length = df['Dimmed Length (in)']
 weight = df['Original Weight (Pounds)']
 
 df['volume'] = height * width * length
