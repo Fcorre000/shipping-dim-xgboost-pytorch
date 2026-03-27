@@ -84,7 +84,18 @@ cols_to_drop = [
     'Service Description',
 
     #LEAKED FEATURE, critical to remove
-    'Shipment Rated Weight(Pounds)'
+    'Shipment Rated Weight(Pounds)',
+    #LEAKED FEATURES, critical to remove                                                             
+    'Shipment Rated Weight(Pounds)',                                                                   
+    'Shipment Freight Charge Amount USD',
+    'Shipment Miscellaneous Charge USD',                                                               
+    'Shipment Duty and Tax Charge USD',                                                                
+    'Shipment Discount Amount USD',                                                                  
+    'Net Charge Amount USD',                                                                           
+    'Shipment Freight Charge Billed Currency',                                                       
+    'Shipment Miscellaneous Charge Billed Currency',                                                   
+    'Shipment Duty and Tax Charge Billed Currency',
+    'Shipment Discount Billed Currency',
 ]
 
 #drop columns listed above, if column isn't there or spelling mistake, won't crash
@@ -109,7 +120,6 @@ weight = df['Original Weight (Pounds)']
 df['volume'] = height * width * length
 df['dim_weight_calculator'] = df['volume'] / 139
 df['dim_weight_ratio'] = df['dim_weight_calculator'] / weight
-df['cost_per_pound'] = df["Net Charge Billed Currency"] / weight
 df['has_dimensions'] = ((height > 0) & (width > 0) & (length > 0)).astype(int)
 
 df.replace([np.inf, -np.inf], np.nan, inplace=True)
