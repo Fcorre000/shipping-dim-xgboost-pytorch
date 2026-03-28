@@ -12,7 +12,7 @@ df = pd.read_excel('notebooks/FedEx_ShipmentDetail.xlsx')
 
 #keeps only rows where DIM flag column is not null, not real shipments can't be used for training
 df = df[df['Shipment DIM Flag (Y or N)'].notna()]
-
+df = df[df['Net Charge Billed Currency'] <= 200]
 # "~" inverts the condition, so you keep everything EXCEPT DIM=Y rows that have all three dimensions at zero
 df = df[~(
     (df['Shipment DIM Flag (Y or N)'] == 'Y') &
