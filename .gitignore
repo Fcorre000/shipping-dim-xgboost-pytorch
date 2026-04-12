@@ -209,3 +209,4 @@ __marimo__/
 /notebooks/FedEx_ShipmentDetail.xlsx
 .gitignore
 .DS_Store
+*.csv
