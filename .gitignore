@@ -210,3 +210,5 @@ __marimo__/
 .gitignore
 .DS_Store
 *.csv
+# Allow the DAS zip code reference file (derived from public FedEx data)
+!data/das_zips.csv

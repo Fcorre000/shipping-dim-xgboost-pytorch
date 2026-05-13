@@ -4,6 +4,56 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import joblib
 import os
+from math import radians, cos, sin, asin, sqrt
+
+try:
+    import pgeocode
+    _PGEOCODE_AVAILABLE = True
+except ImportError:
+    _PGEOCODE_AVAILABLE = False
+    print("WARNING: pgeocode not installed — geographic features will be NaN. Run: pip install pgeocode")
+
+_NOMI = None
+
+def _get_nomi():
+    global _NOMI
+    if _NOMI is None:
+        _NOMI = pgeocode.Nominatim('us')
+    return _NOMI
+
+def _haversine_miles(lat1, lon1, lat2, lon2):
+    R = 3958.8
+    lat1, lon1, lat2, lon2 = map(radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+    a = sin((lat2 - lat1) / 2)**2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2)**2
+    return 2 * R * asin(sqrt(max(0.0, min(1.0, a))))
+
+def _build_zip_lookup(zips: pd.Series, cache_path: str = 'data/zip_lookup.parquet') -> dict:
+    """Return {zip_str: {'latitude': float, 'longitude': float}} with parquet cache."""
+    unique_zips = [str(z).zfill(5) for z in zips.dropna().unique()]
+    if os.path.exists(cache_path):
+        cached_df = pd.read_parquet(cache_path)
+        cached = {row['zip']: {'latitude': row['latitude'], 'longitude': row['longitude']}
+                  for _, row in cached_df.iterrows()}
+    else:
+        cached = {}
+    missing = [z for z in unique_zips if z not in cached]
+    if missing and _PGEOCODE_AVAILABLE:
+        nomi = _get_nomi()
+        rows = []
+        for z in missing:
+            r = nomi.query_postal_code(z)
+            lat = float(r.latitude) if pd.notna(r.latitude) else float('nan')
+            lon = float(r.longitude) if pd.notna(r.longitude) else float('nan')
+            cached[z] = {'latitude': lat, 'longitude': lon}
+            rows.append({'zip': z, 'latitude': lat, 'longitude': lon})
+        os.makedirs(os.path.dirname(cache_path) if os.path.dirname(cache_path) else '.', exist_ok=True)
+        new_df = pd.DataFrame(rows)
+        if os.path.exists(cache_path):
+            existing = pd.read_parquet(cache_path)
+            pd.concat([existing, new_df], ignore_index=True).to_parquet(cache_path, index=False)
+        else:
+            new_df.to_parquet(cache_path, index=False)
+    return cached
 
 df = pd.read_csv('2years.csv', low_memory=False)
 
@@ -29,6 +79,14 @@ df = df[~(
 #keep only domestic shipments, DIM divisor is 139 for domestic and 169 for intl
 #keeping international would confuse the model (2years.csv has 176 intl rows)
 df = df[df['Domestic/Intl'] ==  'Domestic']
+
+##### DECOMPOSED REGRESSION TARGETS (Phase 1.3) ###########################################
+# Computed here before the charge columns are dropped from the feature space.
+# These become additional target columns saved to parquet — never used as features.
+# log_base_charge: base transport cost (largest component of net charge)
+# log_misc_charge: accessorial/surcharges (residential, DAS, etc.)
+df['log_base_charge'] = np.log1p(df['Shipment Freight Charge Amount USD'].fillna(0))
+df['log_misc_charge'] = np.log1p(df['Shipment Miscellaneous Charge USD'].clip(lower=0).fillna(0))
 
 ###### COLUMN DROPPING ###########################################
 
@@ -70,21 +128,20 @@ cols_to_drop = [
     'Package Type',
 
     # Address & name columns
+    # NOTE: Shipper Postal Code, Recipient Postal Code, Recipient State/Province
+    # are intentionally kept — they are engineered into geographic features below.
     'Shipper Name',
     'Shipper Company Name',
     'Shipper Address',
     'Shipper City',
     'Shipper State/Province',
     'Shipper Country/Territory',
-    'Shipper Postal Code',
     'Proof Of Delivery Recipient',      # capital O in 2years.csv
     'Recipient Name',
     'Recipient Company Name',
     'Recipient Address',
     'Recipient City',
-    'Recipient State/Province',
     'Recipient Country/Territory',
-    'Recipient Postal Code',
     'Recipient Original Address',
     'Recipient Original City',
     'Recipient Original Postal Code',
@@ -158,6 +215,65 @@ df = df.drop(columns=['Invoice Month (yyyymm)'])
 # drop so the model isn't burning split capacity on noise.
 df = df.drop(columns=['Pieces In Shipment'], errors='ignore')
 
+##### GEOGRAPHIC FEATURES (Phase 1.1) ###########################################
+# Recover zip-code-derived distance and lat/lon signal that was previously dropped.
+# zip_lookup.parquet caches pgeocode results so reruns don't re-query the GeoNames DB.
+#
+# The raw data stores many postal codes as 9-digit ZIP+4 barcodes (e.g., 894415600).
+# We normalize to the first 5 digits before lookup.
+
+def _normalize_zip(z):
+    digits = ''.join(c for c in str(z) if c.isdigit())
+    return digits[:5] if len(digits) >= 5 else digits.zfill(5)
+
+shipper_zips   = df['Shipper Postal Code'].apply(_normalize_zip)
+recipient_zips = df['Recipient Postal Code'].apply(_normalize_zip)
+all_zips = pd.concat([shipper_zips, recipient_zips])
+
+zip_map = _build_zip_lookup(all_zips, cache_path='data/zip_lookup.parquet')
+
+def _lat(z):
+    return zip_map.get(_normalize_zip(z), {}).get('latitude', float('nan'))
+
+def _lon(z):
+    return zip_map.get(_normalize_zip(z), {}).get('longitude', float('nan'))
+
+df['shipper_lat']   = df['Shipper Postal Code'].apply(_lat)
+df['shipper_lon']   = df['Shipper Postal Code'].apply(_lon)
+df['recipient_lat'] = df['Recipient Postal Code'].apply(_lat)
+df['recipient_lon'] = df['Recipient Postal Code'].apply(_lon)
+
+def _dist_row(row):
+    vals = [row['shipper_lat'], row['shipper_lon'], row['recipient_lat'], row['recipient_lon']]
+    if any(v != v for v in vals):   # NaN check without importing math.isnan
+        return float('nan')
+    return _haversine_miles(row['shipper_lat'], row['shipper_lon'],
+                             row['recipient_lat'], row['recipient_lon'])
+
+df['origin_dest_miles'] = df.apply(_dist_row, axis=1)
+
+##### DAS SURCHARGE FLAG (Phase 1.2) ###########################################
+# FedEx DAS/EDAS zip list must be created manually as data/das_zips.csv
+# (columns: zip, das_type where das_type in {NONE, DAS, EDAS, REMOTE}).
+# If the file is absent all rows get das_type='NONE' and the columns are still
+# one-hot encoded, so the feature matrix shape is consistent once the file is added.
+
+DAS_PATH = 'data/das_zips.csv'
+if os.path.exists(DAS_PATH):
+    das_lookup = pd.read_csv(DAS_PATH, dtype={'zip': str})
+    das_map = dict(zip(das_lookup['zip'].str.zfill(5), das_lookup['das_type']))
+    print(f"DAS lookup loaded: {len(das_map):,} zips")
+else:
+    das_map = {}
+    print("WARNING: data/das_zips.csv not found — das_type='NONE' for all rows. "
+          "Download the FedEx DAS zip list and save as data/das_zips.csv to activate this feature.")
+
+df['das_type'] = (df['Recipient Postal Code'].apply(_normalize_zip)
+                  .map(das_map).fillna('NONE'))
+
+# Raw postal code columns have been fully encoded into numeric features — drop them now.
+df = df.drop(columns=['Shipper Postal Code', 'Recipient Postal Code'], errors='ignore')
+
 df.replace([np.inf, -np.inf], np.nan, inplace=True)
 df.fillna(0, inplace=True)
 
@@ -181,7 +297,8 @@ df['zone_clean'] = df['Pricing Zone'].apply(clean_zone)
 ###### ONE-HOT ENCODING ###########################################
 
 #convert values to 0 or 1
-df = pd.get_dummies(df,columns = ['Service Type', 'Pay Type', 'zone_clean'], drop_first=False)
+df = pd.get_dummies(df, columns=['Service Type', 'Pay Type', 'zone_clean',
+                                  'Recipient State/Province', 'das_type'], drop_first=False)
 
 #drop original DIM flag column because we created our own, and drop other non-numeric columns
 df = df.drop(columns=['Shipment DIM Flag (Y or N)', 'Pricing Zone'], errors='ignore')
@@ -210,7 +327,9 @@ val_df.to_parquet('data/val.parquet', index=False)
 test_df.to_parquet('data/test.parquet', index=False)
 
 #Version 2- Scaled(for pytorch neural networks)
-feature_cols = [c for c in train_df.columns if c not in ['dim_flag', 'log_net_charge','Net Charge Billed Currency']]
+target_cols = ['dim_flag', 'log_net_charge', 'Net Charge Billed Currency',
+               'log_base_charge', 'log_misc_charge']
+feature_cols = [c for c in train_df.columns if c not in target_cols]
 
 scaler = StandardScaler()
 train_scaled = train_df.copy()
@@ -237,10 +356,16 @@ joblib.dump(scaler, 'models/preprocessor.pkl')
 ##### PRINT SUMMARY ###########################################
 
 print(f"Train: {len(train_df):,} rows")
-print(f"Val: {len(val_df):,} rows")
-print(f"Test: {len(test_df):,} rows")
-print(f"Features: {len(feature_cols)}")
+print(f"Val:   {len(val_df):,} rows")
+print(f"Test:  {len(test_df):,} rows")
+print(f"Features: {len(feature_cols)}  (was 42 before Phase 1)")
+print(f"Targets: {target_cols}")
 print(f"DIM rate - Train: {train_df['dim_flag'].mean():.3f}")
-print(f"DIM rate - Val: {val_df['dim_flag'].mean():.3f}")
-print(f"DIM rate - Test: {test_df['dim_flag'].mean():.3f}")
-#dim rates should all be very close to 0.322, confirming stratification worked
+print(f"DIM rate - Val:   {val_df['dim_flag'].mean():.3f}")
+print(f"DIM rate - Test:  {test_df['dim_flag'].mean():.3f}")
+# dim rates should all be very close to 0.322, confirming stratification worked
+geo_cols = ['origin_dest_miles', 'shipper_lat', 'shipper_lon', 'recipient_lat', 'recipient_lon']
+print(f"\nGeographic feature non-zero rate (train):")
+for col in geo_cols:
+    nonzero = (train_df[col] != 0).mean()
+    print(f"  {col}: {nonzero:.1%} non-zero")

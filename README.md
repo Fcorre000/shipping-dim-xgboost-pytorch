@@ -53,6 +53,31 @@ This project uses 25 months of real FedEx invoice data (April 2024 to April 2026
 
 ---
 
+## Phase 1: Production Improvements
+
+After the academic comparison above, the pipeline was extended with richer features and production scaffolding (see `handoff.md`). The v2 models were trained on the same data and hyperparameters — only the feature set changed.
+
+### New features added (42 → 105 total)
+
+| Feature | Description |
+|---------|-------------|
+| `origin_dest_miles` | Haversine distance between shipper and recipient zip centroids |
+| `shipper_lat/lon` | Origin coordinates (pgeocode GeoNames lookup, cached) |
+| `recipient_lat/lon` | Destination coordinates |
+| `Recipient State/Province` | 54 one-hot columns for destination state |
+| `das_type` | FedEx Delivery Area Surcharge tier: `DAS` / `EDAS` / `REMOTE` / `NONE` — derived from the official FedEx DAS ZIP code list (June 2025, 25,854 zips) |
+
+### v2 Results vs. v1 Baseline (Test Set)
+
+| Version | Val MAE | Test MAE | Test R² | Notes |
+|---------|---------|----------|---------|-------|
+| XGBoost v1 | $3.36 | $3.88 | 0.8658 | 42 features |
+| **XGBoost v2** | **$2.51** | **$2.77** | **0.8884** | 105 features, Phase 1 |
+
+`origin_dest_miles` ranked **#3 in SHAP** for regression, `das_type_NONE` ranked **#5** — both new features are load-bearing. Classification AUC held at 0.9997–0.9999.
+
+---
+
 ## SHAP Feature Importance
 
 SHAP beeswarm plots reveal what drives each model's decisions:
@@ -105,18 +130,27 @@ Categorical   pricing zone (02 to 08+), service type (Ground / Home Delivery / e
 Temporal      invoice month (yyyymm format)
 ```
 
-**Engineered features (42 total after one-hot encoding):**
+**Engineered features (105 total after one-hot encoding, Phase 1):**
 
 ```python
-volume              = height * width * length              # package volume in cubic inches
-dim_weight_calculator = volume / 139                        # FedEx domestic DIM divisor
+# Dimensional
+volume              = height * width * length
+dim_weight_calculator = volume / 139                         # FedEx domestic DIM divisor
 dim_weight_ratio    = dim_weight_calculator / actual_weight  # >1.0 triggers DIM billing
-billable_weight     = max(actual_weight, dim_weight_calculator)  # what FedEx prices on
-billable_weight_ceil = ceil(billable_weight)                 # matches FedEx rate-card rounding
-has_dimensions      = 1 if all dims > 0, else 0             # binary flag
-ship_year           = invoice_month // 100                   # annual rate card changes
-ship_month          = invoice_month % 100                    # monthly fuel surcharge cycles
-months_since_start  = (year - 2024) * 12 + month            # linear time index for trend
+billable_weight     = max(actual_weight, dim_weight_calculator)
+billable_weight_ceil = ceil(billable_weight)
+has_dimensions      = 1 if all dims > 0, else 0
+
+# Temporal
+ship_year, ship_month, months_since_start                    # rate card + fuel surcharge cycles
+
+# Geographic (Phase 1)
+origin_dest_miles   = haversine(shipper_zip, recipient_zip)  # #3 SHAP feature for regression
+shipper_lat/lon, recipient_lat/lon                           # zip centroid coordinates
+Recipient State/Province                                     # 54 one-hot columns
+
+# Surcharge tier (Phase 1)
+das_type            = DAS | EDAS | REMOTE | NONE             # from FedEx quarterly zip list
 ```
 
 ---
@@ -129,8 +163,9 @@ shipping-dim-xgboost-pytorch/
 ├── notebooks/
 │   ├── 01_eda.ipynb                  # Exploratory analysis & data audit
 │   ├── 03_baseline_models.ipynb      # Logistic + Linear Regression
-│   ├── 04_gradient_boosting.ipynb    # AdaBoost + XGBoost + SHAP
-│   └── 07_final_comparison.ipynb     # Full model comparison on test set
+│   ├── 04_gradient_boosting.ipynb    # AdaBoost + XGBoost + SHAP (v1)
+│   ├── 07_final_comparison.ipynb     # Full model comparison on test set
+│   └── 08_xgboost_v2.ipynb           # Phase 1: XGBoost on enriched features
 │
 ├── src/
 │   ├── 02_preprocessing.py           # Feature engineering & parquet generation
@@ -139,8 +174,13 @@ shipping-dim-xgboost-pytorch/
 │
 ├── figures/                          # EDA plots, confusion matrices, SHAP beeswarms
 ├── models/                           # Saved checkpoints (.pkl / .ckpt / preprocessor)
+│                                     #   xgb_classifier.pkl / xgb_regressor.pkl  (v1)
+│                                     #   xgb_classifier_v2.pkl / xgb_regressor_v2.pkl (Phase 1)
 ├── data/                             # Preprocessed parquet splits (scaled + unscaled)
+│                                     #   das_zips.csv  — FedEx DAS tier by zip (June 2025)
+│                                     #   zip_lookup.parquet  — cached pgeocode results
 ├── documentation/                    # EDA notes, preprocessing decision log
+├── handoff.md                        # Production improvements roadmap (Phases 1–5)
 ├── requirements.txt
 └── README.md
 ```
