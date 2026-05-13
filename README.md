@@ -78,6 +78,53 @@ After the academic comparison above, the pipeline was extended with richer featu
 
 ---
 
+## Phase 2: Uncertainty Quantification
+
+The dashboard needs more than a point estimate — it needs to know *when to trust the prediction*. Phase 2 adds two output layers on top of the v2 models.
+
+### Conformal prediction intervals (regression)
+
+Split-conformal calibration via [MAPIE](https://github.com/scikit-learn-contrib/MAPIE) wraps the prefit XGBoost regressor. Validation set is used for calibration only; coverage is measured on the held-out test set.
+
+| Metric | Target | Achieved |
+|---|---|---|
+| 95% empirical coverage | [0.94, 0.96] | **0.9430** |
+| Mean interval width | $15–$25 expected | **$17.23** |
+| Test MAE (point) | n/a | **$2.77** |
+
+Intervals are produced in log space and transformed back with `np.expm1`. Coverage is preserved by the monotonic transform.
+
+### Isotonic calibration (classification)
+
+The v2 classifier sits at AUC 0.9997, so the raw probabilities are *already* well calibrated — Brier score is **0.00226** before any wrapping. Isotonic regression on the val set leaves it essentially unchanged (Brier 0.00230, AUC 0.9994). A documented negative result: at this AUC, there is no calibration error left to correct. The calibrated wrapper is still shipped so the dashboard can swap in a different base learner later without changing the inference API.
+
+### `src/predict.py`
+
+Single contract for the [dim-risk-engine](https://github.com/Fcorre000/dim-risk-engine) FastAPI service:
+
+```python
+from src.predict import predict_shipment
+
+predict_shipment({
+    'Original Weight (Pounds)': 12.0,
+    'Dimmed Height (cm)': 30, 'Dimmed Width (cm)': 30, 'Dimmed Length (cm)': 60,
+    'Pricing Zone': '05', 'Service Type': 'Home Delivery', 'Pay Type': 'Bill_Sender_Prepaid',
+    'Shipper Postal Code': '76019', 'Recipient Postal Code': '90210',
+    'Recipient State/Province': 'CA', 'Invoice Month (yyyymm)': 202504,
+    'Shipment DIM Flag (Y or N)': 'Y',            # optional, for audit
+    'Net Charge Billed Currency': 78.50,          # optional, for audit
+})
+# {
+#   'dim_predicted': True, 'dim_probability': 0.998, 'dim_disagrees_with_fedex': False,
+#   'charge_predicted': 53.34, 'charge_lower_95': 45.47, 'charge_upper_95': 62.55,
+#   'charge_actual': 78.50, 'charge_outside_interval': True,
+# }
+```
+
+`transform_row(row)` does all v2 feature engineering for a single dict — zip → lat/lon + haversine miles, DAS tier lookup, zone cleanup, one-hot alignment to the 105-column training schema. Reused by `predict_shipment` and available standalone for batch paths.
+
+---
+
 ## SHAP Feature Importance
 
 SHAP beeswarm plots reveal what drives each model's decisions:
@@ -165,17 +212,23 @@ shipping-dim-xgboost-pytorch/
 │   ├── 03_baseline_models.ipynb      # Logistic + Linear Regression
 │   ├── 04_gradient_boosting.ipynb    # AdaBoost + XGBoost + SHAP (v1)
 │   ├── 07_final_comparison.ipynb     # Full model comparison on test set
-│   └── 08_xgboost_v2.ipynb           # Phase 1: XGBoost on enriched features
+│   ├── 08_xgboost_v2.ipynb           # Phase 1: XGBoost on enriched features
+│   └── 09_uncertainty_quantification.ipynb  # Phase 2: MAPIE intervals + isotonic calibration
 │
 ├── src/
 │   ├── 02_preprocessing.py           # Feature engineering & parquet generation
 │   ├── 05_pytorch_classification.py  # PyTorch Lightning FFNN, DIM classifier
-│   └── 06_pytorch_regression.py      # PyTorch Lightning FFNN, charge regressor
+│   ├── 06_pytorch_regression.py     # PyTorch Lightning FFNN, charge regressor
+│   └── predict.py                    # Phase 2: audit-ready predict_shipment(row) → dict
 │
-├── figures/                          # EDA plots, confusion matrices, SHAP beeswarms
+├── figures/                          # EDA plots, confusion matrices, SHAP beeswarms,
+│                                     #   calibration_*.png, conformal_intervals.png
 ├── models/                           # Saved checkpoints (.pkl / .ckpt / preprocessor)
 │                                     #   xgb_classifier.pkl / xgb_regressor.pkl  (v1)
 │                                     #   xgb_classifier_v2.pkl / xgb_regressor_v2.pkl (Phase 1)
+│                                     #   xgb_classifier_v2_calibrated.pkl              (Phase 2)
+│                                     #   xgb_regressor_v2_conformal.pkl                (Phase 2)
+│                                     #   feature_columns.json / phase_2_metrics.json   (Phase 2)
 ├── data/                             # Preprocessed parquet splits (scaled + unscaled)
 │                                     #   das_zips.csv  — FedEx DAS tier by zip (June 2025)
 │                                     #   zip_lookup.parquet  — cached pgeocode results

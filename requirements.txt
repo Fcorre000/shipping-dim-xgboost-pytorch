@@ -45,3 +45,6 @@ ipykernel>=6.29
 
 # Phase 1 additions
 pgeocode>=0.5.0        # zip-code lat/lon lookup for origin_dest_miles feature
+
+# Phase 2 additions
+mapie>=1.0,<1.1        # split-conformal prediction intervals for regression

@@ -1,0 +1,21 @@
+{
+  "regression": {
+    "confidence_level": 0.95,
+    "empirical_coverage": 0.9430479873439972,
+    "mean_interval_width": 17.232864041044316,
+    "median_interval_width": 16.829872190500133,
+    "test_mae_dollars": 2.7720459437156566
+  },
+  "classification": {
+    "raw": {
+      "auc": 0.9997414319233868,
+      "brier": 0.0022569009825642626,
+      "logloss": 0.011412339708748137
+    },
+    "isotonic": {
+      "auc": 0.9993510309446232,
+      "brier": 0.0023007700975082187,
+      "logloss": 0.021612169570276608
+    }
+  }
+}
