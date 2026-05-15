@@ -54,3 +54,7 @@ lightgbm>=4.3.0        # gradient boosting bake-off candidate
 catboost>=1.2.5        # gradient boosting bake-off candidate
 tabpfn>=2.5.0          # transformer foundation model for tabular data
 # autogluon-tabular>=1.1.0  # optional, ~2GB install — uncomment to run AutoGluon
+
+# Phase 5 additions
+mlflow>=2.10.0         # experiment tracking with local file backend (./mlruns)
+scipy>=1.11             # wasserstein_distance / stats helpers for src/drift.py

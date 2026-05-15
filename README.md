@@ -149,9 +149,9 @@ LightGBM nominally wins AUC but the spread across all three is **0.0005** — wi
 
 CatBoost wins regression cleanly: **−$0.10 MAE (−3.4%), +0.011 R², 3× faster** than XGBoost. Production swap is worth doing — the conformal wrapper from Phase 2 will need to be refit on top of CatBoost before the dashboard cuts over.
 
-### TabPFN-2.5 — documented skip
+### TabPFN-2.5 — ran, underperformed
 
-The `tabpfn` 8.x release moved to a hosted license model: model weights are now gated behind an account on `ux.priorlabs.ai` and a `TABPFN_TOKEN` environment variable. The bake-off attempts TabPFN but catches the `TabPFNLicenseError` and continues without it. Adding TabPFN to a future run requires a one-time browser license acceptance and exporting the token before re-executing the notebook. Per the working agreement, this is recorded as a finding rather than masked.
+The `tabpfn` 8.x release moved to a hosted license model (account on `ux.priorlabs.ai`, `TABPFN_TOKEN` env var). After accepting the license we ran the bake-off variant `notebooks/10b_tabpfn_colab.ipynb` on a Colab T4 GPU with the recommended 10K-row training subset. TabPFN underperformed CatBoost, LightGBM, and XGBoost v2 on both tasks — no win on AUC or MAE. The local notebook (`notebooks/10_model_bakeoff.ipynb`) still wraps the TabPFN cell in try/except so it degrades gracefully when no token is set. Per the working agreement, the negative result is recorded rather than buried.
 
 ### Artifacts
 
@@ -225,6 +225,57 @@ models/autoencoder.pt               # state_dict + hparams (decoupled from Light
 models/scaler_v2.pkl                # StandardScaler fit on v2 train.parquet
 models/anomaly_threshold.json       # threshold + per-detector reference quantiles
 notebooks/11_anomaly_detection.ipynb
+```
+
+---
+
+## Phase 5: Production Scaffolding
+
+The dashboard team (`dim-risk-engine`) needs three things to ship: a record of which model was trained on what, a way to detect when production data drifts from training data, and a stable API contract. Phase 5 delivers all three with the smallest possible surface area — no tracking server, no scheduler, no alerting.
+
+### 5.1 MLflow experiment tracking
+
+`src/log_to_mlflow.py` replays the Phase 3 bake-off into a local file-store at `./mlruns`. One MLflow run per (model, task) pair plus a `winners` summary run, all under the `phase_3_bakeoff` experiment. Re-running training is unnecessary — metrics come from `models/phase_3_metrics.json`, model pickles are logged as artifacts.
+
+```bash
+python src/log_to_mlflow.py
+mlflow ui --backend-store-uri ./mlruns
+```
+
+### 5.2 Drift detection (`src/drift.py`)
+
+Standard Population Stability Index. Bin edges drawn from reference quantiles, log-frequency ratios summed across bins:
+
+| PSI band | Interpretation |
+|---|---|
+| `< 0.10` | no significant shift |
+| `0.10 – 0.25` | moderate — investigate |
+| `>= 0.25` | major — re-train candidate |
+
+CLI sanity check (train vs test, same stratified split) — every feature lands well under the threshold, confirming the implementation is sound:
+
+```
+features compared: 105
+mean PSI:   0.0003
+max  PSI:   0.0022   (dim_weight_ratio)
+major (>=0.25): 0
+moderate (>=0.10): 0
+```
+
+The dashboard backend will call `check_drift('data/train.parquet', 'data/recent_month.parquet')` monthly; the dict it returns is the entire contract. No alerting in this repo — the caller decides what to do.
+
+### 5.3 Inference API contract
+
+`src/api_contract.md` — one-page spec of `predict_shipment` request/response JSON. Tied to the v2 feature set (105 columns, `models/feature_columns.json`). The FastAPI wrapper in `dim-risk-engine` conforms to that schema directly.
+
+### Artifacts
+
+```
+src/log_to_mlflow.py                # replays Phase 3 into ./mlruns
+src/drift.py                        # PSI implementation + check_drift(ref, current)
+src/api_contract.md                 # request/response schema for dim-risk-engine
+mlruns/                             # local MLflow file store (7 runs: 3 cls + 3 reg + winners)
+models/drift_train_vs_test.json     # sanity-check PSI report
 ```
 
 ---

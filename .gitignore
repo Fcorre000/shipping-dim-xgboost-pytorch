@@ -215,3 +215,6 @@ __marimo__/
 
 # CatBoost training cache (created next to the notebook that trained it)
 catboost_info/
+
+# MLflow local file-store (regenerable via `python src/log_to_mlflow.py`)
+mlruns/
