@@ -212,3 +212,6 @@ __marimo__/
 *.csv
 # Allow the DAS zip code reference file (derived from public FedEx data)
 !data/das_zips.csv
+
+# CatBoost training cache (created next to the notebook that trained it)
+catboost_info/

@@ -125,6 +125,110 @@ predict_shipment({
 
 ---
 
+## Phase 3: Model Bake-off
+
+Now that the feature set has changed, is XGBoost still the right learner? The bake-off retrains LightGBM, CatBoost, and TabPFN-2.5 on the same Phase 1 splits and judges them on the same held-out test parquet (`notebooks/10_model_bakeoff.ipynb`).
+
+### Classification (test set)
+
+| Model | Accuracy | Precision | Recall | F1 | ROC AUC | Latency (µs/row) |
+|-------|----------|-----------|--------|----|---------|------------------|
+| XGBoost v2 | 0.9974 | 0.9951 | 0.9967 | 0.9959 | 0.9997 | 3.9 |
+| **LightGBM** | 0.9972 | 0.9945 | 0.9967 | 0.9956 | **0.9999** | **2.8** |
+| CatBoost | 0.9972 | 0.9951 | 0.9962 | 0.9956 | 0.9994 | 2.0 |
+
+LightGBM nominally wins AUC but the spread across all three is **0.0005** — within noise. Practically a three-way tie. Production stays on the XGBoost classifier because the Phase 2 isotonic-calibration wrapper is already fitted on top of it and the AUC gain isn't worth refitting.
+
+### Regression (test set, dollars)
+
+| Model | MAE | RMSE | R² | Latency (µs/row) |
+|-------|-----|------|----|------------------|
+| XGBoost v2 | $2.77 | $6.93 | 0.8884 | 5.8 |
+| LightGBM | $2.75 | $6.95 | 0.8877 | 37.1 |
+| **CatBoost** | **$2.68** | **$6.57** | **0.8996** | **1.8** |
+
+CatBoost wins regression cleanly: **−$0.10 MAE (−3.4%), +0.011 R², 3× faster** than XGBoost. Production swap is worth doing — the conformal wrapper from Phase 2 will need to be refit on top of CatBoost before the dashboard cuts over.
+
+### TabPFN-2.5 — documented skip
+
+The `tabpfn` 8.x release moved to a hosted license model: model weights are now gated behind an account on `ux.priorlabs.ai` and a `TABPFN_TOKEN` environment variable. The bake-off attempts TabPFN but catches the `TabPFNLicenseError` and continues without it. Adding TabPFN to a future run requires a one-time browser license acceptance and exporting the token before re-executing the notebook. Per the working agreement, this is recorded as a finding rather than masked.
+
+### Artifacts
+
+```
+models/best_v3_classifier.pkl       # LightGBM (per-metric winner)
+models/best_v3_regressor.pkl        # CatBoost  (per-metric winner)
+models/best_v3.pkl                  # {'classifier': ..., 'regressor': ...} bundle
+models/phase_3_metrics.json         # winners + full comparison tables (JSON)
+```
+
+---
+
+## Phase 4: Anomaly Detection (Second-Opinion Flag)
+
+The supervised models say *"I expected X, you charged Y."* An unsupervised detector says *"this shipment looks unusual."* Their intersection is the high-precision audit queue.
+
+### Two detectors
+
+| Detector | Input | Score |
+|----------|-------|-------|
+| `IsolationForest` (200 trees, contamination=0.05) | raw 105-feature parquet | `-score_samples` (higher = more anomalous) |
+| Autoencoder (PyTorch Lightning, 105 → 64 → 16 → 64 → 105, MSE, AdamW + cosine LR, 30 epochs) | StandardScaler-normalised features | per-row reconstruction MSE |
+
+Each row's raw score is converted to a **percentile rank against the train distribution**; the two percentiles are averaged into a single `anomaly_score ∈ [0, 1]`. The threshold is calibrated so the test-set fire rate lands inside the 2–8% band the handoff specifies.
+
+### Calibration
+
+| Metric | Target | Achieved |
+|---|---|---|
+| Threshold (combined percentile) | 95th pct as starting point | **0.95** (no tuning needed) |
+| Test-set anomaly fire rate | [2%, 8%] | **2.72%** |
+
+### Three-signal review queue in `predict.py`
+
+The full audit-inference output now combines all three signals:
+
+```python
+review_recommended = dim_disagrees_with_fedex OR charge_outside_interval OR anomaly_flagged
+review_priority    = 'high'   if 2+ signals fire
+                     'medium' if exactly 1 signal fires
+                     'low'    if no signals fire
+```
+
+End-to-end smoke test on a single test row:
+
+```json
+{
+  "dim_predicted": true,
+  "dim_probability": 0.998,
+  "dim_disagrees_with_fedex": false,
+  "charge_predicted": 53.34,
+  "charge_lower_95": 45.47,
+  "charge_upper_95": 62.55,
+  "charge_actual": 127.23,
+  "charge_outside_interval": true,
+  "anomaly_score": 0.984,
+  "anomaly_flagged": true,
+  "review_recommended": true,
+  "review_priority": "high"
+}
+```
+
+Two of the three signals fire here — the predicted charge sits well below the actual ($127 vs $45–63 interval) **and** the row is in the top ~1.6% most-anomalous of the train distribution — so the dashboard surfaces it as high-priority for review.
+
+### Artifacts
+
+```
+src/anomaly.py                      # IsolationForest + Lightning autoencoder, score_shipment(X)
+models/isolation_forest.pkl
+models/autoencoder.pt               # state_dict + hparams (decoupled from Lightning trainer state)
+models/scaler_v2.pkl                # StandardScaler fit on v2 train.parquet
+models/anomaly_threshold.json       # threshold + per-detector reference quantiles
+notebooks/11_anomaly_detection.ipynb
+```
+
+---
+
 ## SHAP Feature Importance
 
 SHAP beeswarm plots reveal what drives each model's decisions:
@@ -213,13 +317,16 @@ shipping-dim-xgboost-pytorch/
 │   ├── 04_gradient_boosting.ipynb    # AdaBoost + XGBoost + SHAP (v1)
 │   ├── 07_final_comparison.ipynb     # Full model comparison on test set
 │   ├── 08_xgboost_v2.ipynb           # Phase 1: XGBoost on enriched features
-│   └── 09_uncertainty_quantification.ipynb  # Phase 2: MAPIE intervals + isotonic calibration
+│   ├── 09_uncertainty_quantification.ipynb  # Phase 2: MAPIE intervals + isotonic calibration
+│   ├── 10_model_bakeoff.ipynb        # Phase 3: LightGBM / CatBoost / TabPFN vs XGBoost v2
+│   └── 11_anomaly_detection.ipynb    # Phase 4: IsolationForest + autoencoder, threshold calibration
 │
 ├── src/
 │   ├── 02_preprocessing.py           # Feature engineering & parquet generation
 │   ├── 05_pytorch_classification.py  # PyTorch Lightning FFNN, DIM classifier
 │   ├── 06_pytorch_regression.py     # PyTorch Lightning FFNN, charge regressor
-│   └── predict.py                    # Phase 2: audit-ready predict_shipment(row) → dict
+│   ├── predict.py                    # Phase 2/4: audit-ready predict_shipment(row) → dict
+│   └── anomaly.py                    # Phase 4: IsolationForest + autoencoder, score_shipment(X)
 │
 ├── figures/                          # EDA plots, confusion matrices, SHAP beeswarms,
 │                                     #   calibration_*.png, conformal_intervals.png
@@ -229,6 +336,10 @@ shipping-dim-xgboost-pytorch/
 │                                     #   xgb_classifier_v2_calibrated.pkl              (Phase 2)
 │                                     #   xgb_regressor_v2_conformal.pkl                (Phase 2)
 │                                     #   feature_columns.json / phase_2_metrics.json   (Phase 2)
+│                                     #   best_v3.pkl / best_v3_classifier.pkl / best_v3_regressor.pkl (Phase 3)
+│                                     #   phase_3_metrics.json                                         (Phase 3)
+│                                     #   isolation_forest.pkl / autoencoder.pt / scaler_v2.pkl        (Phase 4)
+│                                     #   anomaly_threshold.json                                       (Phase 4)
 ├── data/                             # Preprocessed parquet splits (scaled + unscaled)
 │                                     #   das_zips.csv  — FedEx DAS tier by zip (June 2025)
 │                                     #   zip_lookup.parquet  — cached pgeocode results

@@ -48,3 +48,9 @@ pgeocode>=0.5.0        # zip-code lat/lon lookup for origin_dest_miles feature
 
 # Phase 2 additions
 mapie>=1.0,<1.1        # split-conformal prediction intervals for regression
+
+# Phase 3 additions
+lightgbm>=4.3.0        # gradient boosting bake-off candidate
+catboost>=1.2.5        # gradient boosting bake-off candidate
+tabpfn>=2.5.0          # transformer foundation model for tabular data
+# autogluon-tabular>=1.1.0  # optional, ~2GB install — uncomment to run AutoGluon

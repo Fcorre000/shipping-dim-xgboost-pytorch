@@ -1,13 +1,18 @@
 """Audit-ready inference for the dim-risk-engine dashboard.
 
 `predict_shipment(row)` is the single contract the FastAPI service calls. It runs
-the v2 calibrated classifier and the conformal-wrapped v2 regressor against a
-single shipment and returns the schema documented below.
+the v2 calibrated classifier, the conformal-wrapped v2 regressor, and the
+Phase 4 anomaly detectors against a single shipment, returning the schema
+documented below.
 
-Artifacts loaded (all produced in Phase 1 and Phase 2):
-    models/xgb_classifier_v2_calibrated.pkl
-    models/xgb_regressor_v2_conformal.pkl       (SplitConformalRegressor)
-    models/feature_columns.json                  (105-feature column order)
+Artifacts loaded (produced in Phases 1, 2, and 4):
+    models/xgb_classifier_v2_calibrated.pkl     (Phase 2)
+    models/xgb_regressor_v2_conformal.pkl       (Phase 2 — SplitConformalRegressor)
+    models/feature_columns.json                  (Phase 2 — 105-feature column order)
+    models/isolation_forest.pkl                  (Phase 4)
+    models/autoencoder.pt                        (Phase 4)
+    models/scaler_v2.pkl                         (Phase 4)
+    models/anomaly_threshold.json                (Phase 4)
     data/zip_lookup.parquet                      (pgeocode cache)
     data/das_zips.csv                            (FedEx DAS tier lookup)
 """
@@ -175,15 +180,20 @@ def predict_shipment(row: dict) -> dict:
         Optional ground-truth fields for audit:
             Shipment DIM Flag (Y or N), Net Charge Billed Currency
 
-    Output:
-        dim_predicted:           bool
-        dim_probability:         float in [0, 1] (isotonic-calibrated)
+    Output schema:
+        dim_predicted:            bool
+        dim_probability:          float in [0, 1] (isotonic-calibrated)
         dim_disagrees_with_fedex: bool | None
-        charge_predicted:        float (USD)
-        charge_lower_95:         float (USD)
-        charge_upper_95:         float (USD)
-        charge_actual:           float | None
-        charge_outside_interval: bool | None
+        charge_predicted:         float (USD)
+        charge_lower_95:          float (USD)
+        charge_upper_95:          float (USD)
+        charge_actual:            float | None
+        charge_outside_interval:  bool | None
+        anomaly_score:            float in [0, 1] (combined percentile rank)
+        anomaly_flagged:          bool
+        review_recommended:       bool (any of three signals fired)
+        review_priority:          'high' | 'medium' | 'low'
+                                  ('high' if 2+ signals, 'medium' if 1, 'low' if 0)
     """
     clf, reg, _, _, _ = _load_artifacts()
     X = transform_row(row)
@@ -215,6 +225,32 @@ def predict_shipment(row: dict) -> dict:
     else:
         outside = None
 
+    # Phase 4 — anomaly second opinion. Imported lazily so predict.py still
+    # works if the Phase 4 artifacts haven't been trained yet (the import
+    # would otherwise raise FileNotFoundError on module load).
+    try:
+        from anomaly import score_shipment as _score_anomaly  # type: ignore
+        anomaly = _score_anomaly(X)
+        anomaly_score = anomaly['anomaly_score']
+        anomaly_flagged = anomaly['anomaly_flagged']
+    except (ImportError, FileNotFoundError):
+        anomaly_score = None
+        anomaly_flagged = None
+
+    signals = [
+        disagrees is True,
+        outside is True,
+        anomaly_flagged is True,
+    ]
+    fired = sum(signals)
+    review_recommended = fired >= 1
+    if fired >= 2:
+        review_priority = 'high'
+    elif fired == 1:
+        review_priority = 'medium'
+    else:
+        review_priority = 'low'
+
     return {
         'dim_predicted': dim_pred,
         'dim_probability': p_dim,
@@ -224,6 +260,10 @@ def predict_shipment(row: dict) -> dict:
         'charge_upper_95': charge_hi,
         'charge_actual': charge_actual,
         'charge_outside_interval': outside,
+        'anomaly_score': anomaly_score,
+        'anomaly_flagged': anomaly_flagged,
+        'review_recommended': review_recommended,
+        'review_priority': review_priority,
     }
 
 
